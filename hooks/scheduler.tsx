@@ -62,6 +62,8 @@ let isMenuConfirmed = false
 let menuValue: string | undefined
 let isTickQueued = false
 let isTurnRunning = false
+/** When the main loop last started a turn, to tell a resume that went out from one stuck behind a dialog. */
+let lastTurnStart = 0
 let sessionIdCache: string | undefined
 let limits: SessionRateLimit[] = []
 let tz: TzOffset = systemOffset
@@ -210,7 +212,68 @@ async function resume($: EngineInterface, config: Config, force = false): Promis
   dbg($, `resuming (${reason})`)
   await rearm($)
   // Not awaited: it resolves when the turn starts, and waits for idle first.
+  const sentAt = await $.clock.now()
   void $.prompt.submit({ text: config.text, asUser: true }).catch(report($))
+  watchResume($, sentAt, force)
+}
+
+/** How long a resume may sit queued before the person is told something holds it. */
+const STUCK_MS = 30_000
+
+/**
+ * A prompt waits for idle, and a dialog that holds the keys (the native `/rate-limit-options` one opens when
+ * Claude Code's own auto-continue is not armed) is never idle: the resume would sit there unseen. No plugin API
+ * closes that dialog, so after STUCK_MS with no turn started, and no turn running (an Escape would interrupt it),
+ * the terminal is asked for an Escape: `herdr pane send-keys` inside herdr, `tmux send-keys` inside tmux. A
+ * resume the person pressed themselves ('Reanudar ya') is theirs to unstick, so it only gets the warning.
+ */
+function watchResume($: EngineInterface, sentAt: number, force: boolean): void {
+  $.clock.after(STUCK_MS, async () => {
+    if (lastTurnStart >= sentAt) return
+    dbg($, `resume queued ${STUCK_MS / 1000}s ago and no turn started: a dialog may hold the session`)
+    const sent = force || isTurnRunning ? false : await escapeDialog($).catch(() => false)
+    $.ui.toast(
+      sent
+        ? 'La reanudación estaba retenida por un diálogo: envío Escape a la terminal y sigue sola.'
+        : 'La reanudación está en cola y no arranca: ¿hay un diálogo abierto (p. ej. /rate-limit-options)? Ciérralo con Esc y seguirá sola.',
+    )
+  })
+}
+
+/** Sends one Escape to the pane the session runs in; false when there is no pane to reach or the multiplexer refused. */
+async function escapeDialog($: EngineInterface): Promise<boolean> {
+  const herdrPane = await $.env.get('HERDR_PANE_ID')
+  if (herdrPane !== undefined && herdrPane !== '') {
+    const bin = (await $.env.get('HERDR_BIN_PATH')) ?? 'herdr'
+    const out = await $.process.run([bin, 'pane', 'send-keys', herdrPane, 'esc'], { timeoutMs: 10_000 })
+    dbg($, `escape via herdr pane ${herdrPane}: exit ${out.exitCode}`)
+    return out.exitCode === 0
+  }
+  const tmuxPane = await $.env.get('TMUX_PANE')
+  if (tmuxPane !== undefined && tmuxPane !== '') {
+    const out = await $.process.run(['tmux', 'send-keys', '-t', tmuxPane, 'Escape'], { timeoutMs: 10_000 })
+    dbg($, `escape via tmux pane ${tmuxPane}: exit ${out.exitCode}`)
+    return out.exitCode === 0
+  }
+  return false
+}
+
+/**
+ * Arms the resume from what the rate-limit windows say, for a turn that died on an API error without
+ * `classic.StopFailure` having armed anything. Only a full window counts (any other error is not a limit to wait out),
+ * the retry cap still applies, and an already armed resume is left alone.
+ */
+async function armFromFullWindow($: EngineInterface, config: Config): Promise<void> {
+  if ((await read($, pending)) !== null || !(await isShown($))) return
+  const at = await $.clock.now()
+  const read1 = (await $.session.usage()).rateLimits
+  const rateLimits = read1.length > 0 ? read1 : limits
+  if (findReset(rateLimits, at, { requireFull: true }) === undefined) return
+  const plan = planResume({ error: 'rate_limit', rateLimits, now: at, attempts: await read($, attempts), config, tz })
+  if (plan === undefined) return
+  dbg($, `turn ended in error with a full window and no StopFailure: armed ${plan.reason} for ${new Date(plan.resumeAt).toISOString()}`)
+  await arm($, config, plan)
+  $.ui.toast(`${plan.reason}: reanudo a las ${formatWhen(plan.resumeAt, at, tz)} (en ${formatWait(plan.resumeAt - at)}).`)
 }
 
 /** Sets the resume going at `plan.resumeAt`; the poll sends it, shown session or not. */
@@ -557,6 +620,7 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId === undefined) {
       isTurnRunning = true
+      lastTurnStart = await $.clock.now()
       await markActivity($)
     }
     return done
@@ -602,6 +666,8 @@ export const register: Register = (on, options) => {
       }
       await refreshJobs($)
     }
+    // Second signal for the same failure: if StopFailure never reached us, a turn dead on an API error while a window is full still arms.
+    if (e.reason === 'error') await armFromFullWindow($, config).catch(quiet($))
     return done
   }).catch(($, e, next) => next(e))
 

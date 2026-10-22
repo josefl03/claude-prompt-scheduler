@@ -1,6 +1,6 @@
 {
   "name": "prompt-scheduler",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Schedule Claude Code prompts for any time (@17:00, @2h30m, @done, @reset), list and cancel them per session, and resume by itself after a usage limit.",
   "author": {
     "name": "José Fernández",

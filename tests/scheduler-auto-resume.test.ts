@@ -298,3 +298,152 @@ test('parseResetText: clock times, dates and zones', () => {
   expect(zoneOffset('Europe/Madrid')?.(Date.UTC(2026, 11, 1))).toBe(60)
   expect(zoneOffset('Not/AZone')).toBeUndefined()
 })
+
+// ------------------------------------------------ the 5-hour limit, end to end
+
+const TURN_DIED = { turnId: 't-limit', answer: '', durationMs: 1, isAborted: false, reason: 'error' } as const
+
+test('5 h: the notice alone ("session limit · resets …") is enough to arm, with the windows empty', () => {
+  const at = Date.UTC(2026, 9, 22, 19, 0) // 21:00 in Madrid
+  const plan = planResume({
+    error: 'rate_limit',
+    rateLimits: [],
+    now: at,
+    attempts: 0,
+    config,
+    message: "You've hit your session limit · resets 11:50pm (Europe/Madrid)",
+  })
+  expect(plan?.resumeAt).toBe(Date.UTC(2026, 9, 22, 21, 50) + 2 * MINUTE)
+  expect(plan?.isLimit).toBe(true)
+})
+
+test('5 h: a turn that died on an API error with the window full arms the backup even if StopFailure never came', async ($, on) => {
+  const { sent, limits, clock, logs } = engineBeneath(on)
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.turn.start({ text: 'work', turnId: 't-limit' })
+  await $.turn.complete(TURN_DIED)
+  expect(logs.some(l => l.includes('no StopFailure'))).toBe(true)
+  await clock.advance(10 * MINUTE + GRACE - 1)
+  expect(sent).toEqual([])
+  await clock.advance(1)
+  expect(sent).toEqual([DEFAULT_TEXT])
+})
+
+test('5 h: StopFailure and the error turn together arm one resume, and it is sent once', async ($, on) => {
+  const { sent, limits, clock } = engineBeneath(on)
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.turn.start({ text: 'work', turnId: 't-limit' })
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await $.turn.complete(TURN_DIED)
+  await clock.advance(30 * MINUTE)
+  expect(sent).toEqual([DEFAULT_TEXT])
+})
+
+test('5 h: an error turn with no full window is not a limit and arms nothing', async ($, on) => {
+  const { sent, limits, clock } = engineBeneath(on)
+  limits.push({ kind: 'five_hour', percentUsed: 40, resetsAt: new Date(NOW + 10 * MINUTE).toISOString() })
+  await $.session.start(START)
+  await $.turn.complete(TURN_DIED)
+  await clock.advance(30 * MINUTE)
+  expect(sent).toEqual([])
+})
+
+test('5 h: the error turn does not get round the retry cap', async ($, on) => {
+  const { sent, limits, clock } = engineBeneath(on)
+  await $.session.start(START)
+  let at = NOW
+  for (let i = 0; i < config.maxRetries; i++) {
+    limits.length = 0
+    limits.push(...fiveHourFull(10 * MINUTE, at))
+    await $.classic.StopFailure({ error: 'rate_limit' })
+    await clock.advance(10 * MINUTE + GRACE)
+    at += 10 * MINUTE + GRACE
+  }
+  expect(sent.length).toBe(config.maxRetries)
+  limits.length = 0
+  limits.push(...fiveHourFull(10 * MINUTE, at))
+  await $.turn.complete(TURN_DIED)
+  await clock.advance(30 * MINUTE)
+  expect(sent.length).toBe(config.maxRetries)
+})
+
+test('5 h: a resume that no turn picks up (a dialog holds the session) tells the person after 30 s', async ($, on) => {
+  const { toasts, limits, clock, logs } = engineBeneath(on)
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE) // sent; the mock engine starts no turn
+  expect(toasts.some(t => t.includes('diálogo'))).toBe(false)
+  await clock.advance(30_000)
+  expect(toasts.some(t => t.includes('diálogo'))).toBe(true)
+  expect(logs.some(l => l.includes('a dialog may hold the session'))).toBe(true)
+})
+
+test('5 h: a resume that starts a turn raises no dialog warning', async ($, on) => {
+  const { toasts, limits, clock } = engineBeneath(on, { onSubmit: () => void $.turn.start({ text: '', turnId: 'resumed' }) })
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE + 60_000)
+  expect(toasts.some(t => t.includes('diálogo'))).toBe(false)
+})
+
+// ------------------------------------------------ a resume held by a dialog
+
+function terminalBeneath(on: Parameters<typeof engineBeneath>[0], env: Record<string, string>) {
+  const argvs: string[][] = []
+  on('env.get', (_$, e) => ({ value: env[e.name] }))
+  on('process.run', (_$, e) => {
+    argvs.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  return argvs
+}
+
+test('5 h: a resume held 30 s by a dialog gets an Escape through herdr, once', async ($, on) => {
+  const { limits, clock, toasts } = engineBeneath(on)
+  const argvs = terminalBeneath(on, { HERDR_PANE_ID: 'w1:p2', HERDR_BIN_PATH: '/bin/herdr', TMUX_PANE: '%3' })
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE + 29_000)
+  expect(argvs).toEqual([])
+  await clock.advance(2_000)
+  expect(argvs).toEqual([['/bin/herdr', 'pane', 'send-keys', 'w1:p2', 'esc']])
+  expect(toasts.some(t => t.includes('envío Escape'))).toBe(true)
+  await clock.advance(5 * MINUTE)
+  expect(argvs.length).toBe(1)
+})
+
+test('5 h: inside tmux alone the Escape goes through tmux', async ($, on) => {
+  const { limits, clock } = engineBeneath(on)
+  const argvs = terminalBeneath(on, { TMUX_PANE: '%3' })
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE + 31_000)
+  expect(argvs).toEqual([['tmux', 'send-keys', '-t', '%3', 'Escape']])
+})
+
+test('5 h: no Escape when a turn started, when one is running, or when the person pressed Reanudar ya', async ($, on) => {
+  const { limits, clock } = engineBeneath(on, { onSubmit: () => void $.turn.start({ text: '', turnId: 'resumed' }) })
+  const argvs = terminalBeneath(on, { TMUX_PANE: '%3' })
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE + 60_000) // the resume started a turn: nothing to unstick
+  expect(argvs).toEqual([])
+})
+
+test('5 h: with no pane to reach it only warns', async ($, on) => {
+  const { limits, clock, toasts } = engineBeneath(on)
+  const argvs = terminalBeneath(on, {})
+  limits.push(...fiveHourFull(10 * MINUTE))
+  await $.session.start(START)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await clock.advance(10 * MINUTE + GRACE + 31_000)
+  expect(argvs).toEqual([])
+  expect(toasts.some(t => t.includes('Ciérralo con Esc'))).toBe(true)
+})
