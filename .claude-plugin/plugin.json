@@ -1,0 +1,72 @@
+{
+  "name": "prompt-scheduler",
+  "version": "0.1.0",
+  "description": "Schedule Claude Code prompts for any time (@17:00, @2h30m, @done, @reset), list and cancel them per session, and resume by itself after a usage limit.",
+  "author": {
+    "name": "José Fernández",
+    "url": "https://github.com/josefl03"
+  },
+  "homepage": "https://github.com/josefl03/claude-prompt-scheduler",
+  "repository": "https://github.com/josefl03/claude-prompt-scheduler",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "mod",
+    "scheduler",
+    "prompts",
+    "usage-limit",
+    "auto-resume"
+  ],
+  "userConfig": {
+    "schedulerResumeText": {
+      "type": "string",
+      "title": "Resume prompt",
+      "description": "Prompt sent when a usage-limit wait is over.",
+      "default": "The usage limit has reset. Carry on with the task you were working on when the limit stopped you. If it was already finished, say so in one line.",
+      "required": false
+    },
+    "schedulerGraceSeconds": {
+      "type": "number",
+      "title": "Grace after reset (s)",
+      "description": "Extra seconds after the limit resets before resuming (0-900). Claude Code resumes by itself; this backup only sends if the native resume did not act.",
+      "default": 120,
+      "required": false
+    },
+    "schedulerRetryOverloaded": {
+      "type": "boolean",
+      "title": "Retry overloaded/server errors",
+      "description": "Also resume after an overloaded or server error, backing off from one minute.",
+      "default": true,
+      "required": false
+    },
+    "schedulerMaxRetries": {
+      "type": "number",
+      "title": "Most retries in a row",
+      "description": "Give up after this many resumes without a successful answer (1-20).",
+      "default": 5,
+      "required": false
+    },
+    "schedulerCatchUpMinutes": {
+      "type": "number",
+      "title": "Catch-up window (min)",
+      "description": "A scheduled prompt found overdue (app was closed, laptop asleep) is still sent if it is at most this many minutes late; later than that it expires (0-1440).",
+      "default": 180,
+      "required": false
+    },
+    "schedulerPollSeconds": {
+      "type": "number",
+      "title": "Safety poll every (s)",
+      "description": "How often the queue is checked as a safety net (5-60). Exact firing is done by one timer per prompt; the poll catches whatever a suspended laptop missed.",
+      "default": 5,
+      "required": false
+    },
+    "schedulerHoldDuringLimit": {
+      "type": "boolean",
+      "title": "Hold prompts during a usage limit",
+      "description": "A scheduled prompt that falls due while a usage limit is active waits for the reset instead of being sent into a refusal.",
+      "default": true,
+      "required": false
+    }
+  },
+  "types": "./types/index.d.ts"
+}

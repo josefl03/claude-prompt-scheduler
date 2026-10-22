@@ -1,0 +1,17 @@
+{
+  "name": "prompt-scheduler",
+  "owner": {
+    "name": "José Fernández",
+    "url": "https://github.com/josefl03"
+  },
+  "metadata": {
+    "description": "Schedule Claude Code prompts and resume after a usage limit."
+  },
+  "plugins": [
+    {
+      "name": "prompt-scheduler",
+      "source": "./",
+      "description": "Schedule Claude Code prompts for any time (@17:00, @2h30m, @done, @reset), list and cancel them per session, and resume by itself after a usage limit."
+    }
+  ]
+}
